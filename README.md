@@ -268,9 +268,30 @@ Each URL must list **only one universe’s hosts**, for example:
 jdbc:yugabytedb://eu-node1:5433,eu-node2:5433,eu-node3:5433/mydb
   ?load-balance=true
   &topology-keys=onprem.eu-west-1.*:1,onprem.eu-central-1.*:1
+  &fallback-to-topology-keys-only=true
 ```
 
 Do **not** mix EU and US nodes in one URL.
+
+### SmartDriver with two universes in one JVM
+
+SmartDriver load-balances **inside one universe**. This library load-balances **between** universes. Both run together when you keep a separate pool (and JDBC URL) per universe.
+
+When the application holds **two** SmartDriver pools (primary + standby), the driver may call `yb_servers()` on each pool. On YugabyteDB versions that do **not** return `universe_uuid` in `yb_servers()`, the US pool can discover EU nodes (and vice versa). Symptoms:
+
+- Driver log: *"does not send universe_uuid in its response of yb_servers()"*
+- `active=us` in this library but `inet_server_addr()` shows an EU host
+- US health probes stay **HEALTHY** after all US tservers stop → **no universe failover**
+
+**Mitigations** (pick one per deployment):
+
+| Approach | When to use |
+|----------|-------------|
+| `fallback-to-topology-keys-only=true` plus correct `topology-keys` per URL | Two universes, same JVM, no `universe_uuid` yet (validated on 2024.2.2.0) |
+| Upgrade YugabyteDB so `yb_servers()` returns `universe_uuid` | Preferred long-term; SmartDriver can separate universes without topology fallback |
+| `load-balance=false` | External clients (e.g. laptop outside VPC) or when in-universe SmartDriver LB is not required |
+
+`universe_uuid` (or the topology fallback) **does not replace** this library—it only keeps each SmartDriver pool scoped to one universe so JDBC probes report the correct universe health.
 
 ### Manual switch (operator / test)
 
@@ -413,6 +434,105 @@ Passwords in JDBC URLs are **never** logged in clear text (`password=` and URL u
 5. **WARN** on a single `getConnection` failure** — normal for one node reboot; universe should **not** switch until probe thresholds are met (see DEBUG probe counters).
 
 `JdbcThresholdFailoverPolicy` also logs its threshold configuration once at **INFO** when the policy is built.
+
+---
+
+## Live validation
+
+Generic ops scripts live under [`scripts/failover-lab/`](scripts/failover-lab/). A runnable demo app can live locally under `examples/` (gitignored — not published).
+
+**Setup** (once per cluster):
+
+```bash
+cd scripts/failover-lab
+cp hosts.env.example hosts.env              # SSH + node IPs (public or reachable)
+cp hosts-internal.env.example hosts-internal.env   # optional: in-VPC JDBC + topology-keys
+# edit both files with your addresses; set SSH_KEY if not in the file
+export YBA_HOST=ec2-user@203.0.113.1        # jump host inside your VPC (example IP)
+```
+
+| Item | Typical lab value |
+|------|------------------|
+| Primary universe | 3 nodes, multi-region |
+| Standby universe | 3 nodes, xCluster replication |
+| Database | your app DB |
+| Failover policy (lab) | 3 probe failures, 3s probe interval, 30s cooldown |
+
+Set `PRIMARY_UNIVERSE_ID` / `STANDBY_UNIVERSE_ID` in `hosts-internal.env` to match your demo app’s universe ids (e.g. `us` / `eu`).
+
+### Test results (June 2026, private lab)
+
+#### Universe failover
+
+| Run | Client | JDBC | Stop all primary tservers | Universe failover | Notes |
+|-----|--------|------|---------------------------|-------------------|--------|
+| 1 | Laptop (public IPs) | `load-balance=false` | Yes | **Yes** (primary → standby, ~15s) | SmartDriver uses public hosts in URL only |
+| 2 | Jump host (in-VPC) | `load-balance=false`, internal IPs | Yes | **Yes** (~15s) | Recommended in-VPC baseline |
+| 3 | Jump host | `load-balance=true`, topology-keys only | Yes | **No** | Primary pool probed standby nodes; false healthy probes |
+| 4 | Jump host | `load-balance=true` + `fallback-to-topology-keys-only=true` | Yes | **Yes** (~15s) | Queries on primary before outage; standby after switch |
+
+#### Auto-failback (`allowAutoFailback=true`)
+
+| Run | Client | Steps | Result | Notes |
+|-----|--------|-------|--------|--------|
+| 5 | Jump host (automated script) | Stop primary → failover → restart primary before cooldown → wait | **PASS** | `Active universe changed: standby → primary` ~30s after failover |
+| 5a | Jump host (manual, primary still down at failback) | Stop primary → failover → wait cooldown without restart | Failback **fires** but queries **fail** until tservers restarted | Policy failbacks when active standby pool is healthy + cooldown elapsed |
+
+Automated run:
+
+```bash
+export YBA_HOST=ec2-user@203.0.113.1
+./scripts/failover-lab/run-auto-failback-test-on-yba.sh
+# => PASS: auto-failback live test succeeded
+```
+
+#### Unit tests (`JdbcThresholdFailoverPolicy`)
+
+`mvn test` in `universe-failover-core` — 10 tests including `allowAutoFailback`:
+
+| Test | Verifies |
+|------|----------|
+| `autoFailbackDisabled_doesNotReturnToPrimaryWhenOnStandby` | Default `false` → no failback |
+| `autoFailbackEnabled_returnsToPrimaryWhenStandbyActiveAndHealthy` | `FAILBACK_TO_PRIMARY` |
+| `autoFailbackEnabled_blockedDuringCooldown` | Failback blocked during cooldown |
+| `autoFailbackEnabled_doesNotReturnWhenActiveProbeFailuresAccumulating` | No failback while probes failing |
+| `autoFailbackEnabled_doesNotApplyWhenAlreadyOnPrimary` | No-op on primary |
+
+**Takeaways:**
+
+1. **Single-node stop** (one US tserver) did not trigger universe failover—SmartDriver retried other US nodes as expected.
+2. **All three US tservers stopped** triggered failover when the primary pool could not serve `SELECT 1`.
+3. With **`load-balance=true` alone** on 2024.2.2.0, false healthy probes blocked failover; add **`fallback-to-topology-keys-only=true`** (or upgrade for `universe_uuid`).
+4. **`allowAutoFailback(true)`** returns traffic to primary after cooldown; restart the primary universe before cooldown ends so queries succeed after failback.
+5. This library routes JDBC only—it does not run YBA xCluster DR promotion.
+
+### Run auto-failback test (jump host)
+
+```bash
+export YBA_HOST=ec2-user@203.0.113.1
+./scripts/failover-lab/run-auto-failback-test-on-yba.sh
+```
+
+Orchestrates: `ALLOW_AUTO_FAILBACK=true` → stop all primary tservers → failover → restart primary → verify automatic failback (~75s total).
+
+### Run from jump host (internal IPs)
+
+```bash
+mvn clean install -DskipTests   # repo root
+export YBA_HOST=ec2-user@203.0.113.1
+./scripts/failover-lab/run-on-yba.sh all
+```
+
+Steps: `deploy` → `demo` → `failover` → `recover`. Requires a built demo JAR (`FAILOVER_DEMO_JAR`) or a local `examples/` demo module.
+
+### Run locally (public IPs)
+
+```bash
+mvn clean install -DskipTests
+# run your demo app with PRIMARY_HOSTS / STANDBY_HOSTS from hosts.env
+# other terminal:
+./scripts/failover-lab/stop-universe-tservers.sh primary
+```
 
 ---
 

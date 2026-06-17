@@ -6,3 +6,16 @@ target/
 .settings/
 .DS_Store
 *.log
+
+# Local demo app (cluster-specific JDBC URLs, credentials)
+examples/
+
+# Local cluster topology (copy from *.example)
+scripts/failover-lab/hosts.env
+scripts/failover-lab/hosts-internal.env
+
+# SSH keys and deploy artifacts
+*.pem
+**/jenkins_yba
+**/cluster_ssh_key
+**/demo.pid
